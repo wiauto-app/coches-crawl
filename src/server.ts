@@ -6,7 +6,7 @@ import { closePool } from './db/connection.js';
 import { closePlaywrightContext } from './scrapers/playwrightClient.js';
 
 const app = express();
-const port = parseInt(process.env.PORT || '4000', 10);
+const port = parseInt(process.env.PORT || '4001', 10);
 
 // Middleware
 app.use(express.json());

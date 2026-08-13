@@ -28,9 +28,9 @@ services:
     container_name: coches_app
     environment:
       NODE_ENV: ${NODE_ENV:-development}
-      PORT: ${PORT:-4000}
+      PORT: ${PORT:-4001}
       DB_HOST: postgres
-      DB_PORT: 5432
+      DB_PORT: 5435
       DB_NAME: ${DB_NAME:-coches_db}
       DB_USER: ${DB_USER:-coches_user}
       DB_PASSWORD: ${DB_PASSWORD:-coches_password_dev}
@@ -51,7 +51,7 @@ services:
       SPECS_CRAWL_DELAY_MAX_MS: ${SPECS_CRAWL_DELAY_MAX_MS:-1500}
       SPECS_MAX_CONSECUTIVE_BOT_ERRORS: ${SPECS_MAX_CONSECUTIVE_BOT_ERRORS:-3}
     ports:
-      - "4000:4000"
+      - "4001:4001"
     depends_on:
       postgres:
         condition: service_healthy
