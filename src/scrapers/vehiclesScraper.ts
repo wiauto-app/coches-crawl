@@ -20,6 +20,17 @@ interface CrawlContext {
   startedAt: Date;
 }
 
+/** Envelope JSON del gateway: { datalist: [{ value, text }] } en rutas .../form */
+interface ApiFormEnvelope {
+  datalist?: Array<{ value: string; text: string }>;
+}
+
+interface BodyTypeFormRow {
+  id: number;
+  doors: number | null;
+  name: string;
+}
+
 export class VehiclesScraper {
   private client: RetryClient;
   private sectionId: number;
@@ -28,15 +39,15 @@ export class VehiclesScraper {
 
   constructor() {
     const apiBaseUrl =
-      process.env.API_BASE_URL || 'https://vehicle-specs.coches.net';
+      process.env.API_BASE_URL || 'https://web.gw.coches.net';
     this.client = new RetryClient(apiBaseUrl);
     this.sectionId = parseInt(process.env.SCRAPER_SECTION_ID || '2500', 10);
     this.delayMin = parseInt(
-      process.env.SCRAPER_DELAY_MIN_MS || '500',
+      process.env.SCRAPER_DELAY_MIN_MS || '100',
       10
     );
     this.delayMax = parseInt(
-      process.env.SCRAPER_DELAY_MAX_MS || '1000',
+      process.env.SCRAPER_DELAY_MAX_MS || '250',
       10
     );
   }
@@ -44,6 +55,36 @@ export class VehiclesScraper {
   private async delay(): Promise<void> {
     const ms = Math.random() * (this.delayMax - this.delayMin) + this.delayMin;
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async fetchFormDatalist(
+    path: string
+  ): Promise<Array<{ value: string; text: string }>> {
+    const res = await this.client.get<ApiFormEnvelope>(path);
+    return Array.isArray(res?.datalist) ? res.datalist : [];
+  }
+
+  private mapFormRows(
+    items: Array<{ value: string; text: string }>
+  ): ScraperFormResponse[] {
+    return items.map((item) => ({
+      id: parseInt(item.value, 10),
+      name: item.text,
+    }));
+  }
+
+  private mapBodyTypeRows(
+    items: Array<{ value: string; text: string }>
+  ): BodyTypeFormRow[] {
+    return items.map((item) => {
+      const parts = item.value.split('-');
+      const bodyTypeId = parseInt(parts[0] || '0', 10);
+      const doors =
+        parts[1] !== undefined && parts[1] !== ''
+          ? parseInt(parts[1], 10)
+          : null;
+      return { id: bodyTypeId, doors, name: item.text };
+    });
   }
 
   private async updateCrawlLog(
@@ -249,6 +290,7 @@ export class VehiclesScraper {
   }
 
   private async insertVersion(
+    versionId: number,
     makeId: number,
     modelId: number,
     bodyTypeId: number,
@@ -260,11 +302,11 @@ export class VehiclesScraper {
       await query(
         `
         INSERT INTO versions
-        (make_id, model_id, body_type_id, fuel_type_id, year_id, name)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT DO NOTHING
+        (version_id, make_id, model_id, body_type_id, fuel_type_id, year_id, name)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (version_id) DO NOTHING
         `,
-        [makeId, modelId, bodyTypeId, fuelTypeId, yearId, name]
+        [versionId, makeId, modelId, bodyTypeId, fuelTypeId, yearId, name]
       );
     } catch (error) {
       logger.error('Error in insertVersion', {
@@ -319,10 +361,11 @@ export class VehiclesScraper {
 
       // Step 1: Get all makes
       logger.info('Fetching makes...');
-      const makes = await this.client.get<ScraperFormResponse[]>(
-        `/vehicle-specs/v1/makes/form?section1Id=${this.sectionId}`
+      const makes = this.mapFormRows(
+        await this.fetchFormDatalist(
+          `/vehicle-specs/v1/makes/form?section1Id=${this.sectionId}`
+        )
       );
-
       context.total = makes.length;
       logger.info(`Found ${makes.length} makes`);
 
@@ -333,8 +376,10 @@ export class VehiclesScraper {
 
           // Step 2: Get models for this make
           logger.debug(`Fetching models for make: ${make.name}`);
-          const models = await this.client.get<ScraperFormResponse[]>(
-            `/vehicle-specs/v1/models/form?section1Id=${this.sectionId}&makeId=${make.id}`
+          const models = this.mapFormRows(
+            await this.fetchFormDatalist(
+              `/vehicle-specs/v1/models/form?section1Id=${this.sectionId}&makeId=${make.id}`
+            )
           );
 
           for (const model of models) {
@@ -350,20 +395,18 @@ export class VehiclesScraper {
               logger.debug(
                 `Fetching body types for model: ${model.name}`
               );
-              const bodyTypes = await this.client.get<any[]>(
-                `/vehicle-specs/v1/body-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}`
+              const bodyTypes = this.mapBodyTypeRows(
+                await this.fetchFormDatalist(
+                  `/vehicle-specs/v1/body-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}`
+                )
               );
 
               for (const bodyTypeData of bodyTypes) {
                 try {
                   await this.delay();
 
-                  // Parse bodyTypeId from format like "1-3" (take first number)
-                  const bodyTypeId = parseInt(
-                    bodyTypeData.id.toString().split('-')[0],
-                    10
-                  );
-                  const doors = bodyTypeData.doors ? parseInt(bodyTypeData.doors, 10) : null;
+                  const bodyTypeId = bodyTypeData.id;
+                  const doors = bodyTypeData.doors;
 
                   const bodyTypeDbId = await this.getOrCreateBodyType(
                     bodyTypeId,
@@ -375,8 +418,10 @@ export class VehiclesScraper {
                   logger.debug(
                     `Fetching fuel types for body type: ${bodyTypeData.name}`
                   );
-                  const fuelTypes = await this.client.get<ScraperFormResponse[]>(
-                    `/vehicle-specs/v1/fuel-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+                  const fuelTypes = this.mapFormRows(
+                    await this.fetchFormDatalist(
+                      `/vehicle-specs/v1/fuel-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+                    )
                   );
 
                   for (const fuelType of fuelTypes) {
@@ -389,8 +434,10 @@ export class VehiclesScraper {
 
                       // Step 5: Get years
                       logger.debug(`Fetching years for fuel type: ${fuelType.name}`);
-                      const years = await this.client.get<ScraperFormResponse[]>(
-                        `/vehicle-specs/v1/years/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+                      const years = this.mapFormRows(
+                        await this.fetchFormDatalist(
+                          `/vehicle-specs/v1/years/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+                        )
                       );
 
                       for (const yearData of years) {
@@ -402,13 +449,16 @@ export class VehiclesScraper {
 
                           // Step 6: Get versions
                           logger.debug(`Fetching versions for year: ${yearData.id}`);
-                          const versions = await this.client.get<ScraperFormResponse[]>(
-                            `/vehicle-specs/v1/versions/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&year=${yearData.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+                          const versions = this.mapFormRows(
+                            await this.fetchFormDatalist(
+                              `/vehicle-specs/v1/versions/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&year=${yearData.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+                            )
                           );
 
                           for (const version of versions) {
                             try {
                               await this.insertVersion(
+                                version.id,
                                 makeId,
                                 modelId,
                                 bodyTypeDbId,

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -17,7 +15,8 @@ services:
     networks:
       - coches_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-coches_user}"]
+      # Sin -d, libpq usa como nombre de BD el usuario → intenta "coches_user" y falla.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -29,30 +28,44 @@ services:
     container_name: coches_app
     environment:
       NODE_ENV: ${NODE_ENV:-development}
-      PORT: ${PORT:-3000}
+      PORT: ${PORT:-4000}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: ${DB_NAME:-coches_db}
       DB_USER: ${DB_USER:-coches_user}
       DB_PASSWORD: ${DB_PASSWORD:-coches_password_dev}
-      SCRAPER_TIMEOUT_MS: ${SCRAPER_TIMEOUT_MS:-10000}
+      SCRAPER_TIMEOUT_MS: ${SCRAPER_TIMEOUT_MS:-30000}
       SCRAPER_RETRY_ATTEMPTS: ${SCRAPER_RETRY_ATTEMPTS:-3}
-      SCRAPER_DELAY_MIN_MS: ${SCRAPER_DELAY_MIN_MS:-500}
-      SCRAPER_DELAY_MAX_MS: ${SCRAPER_DELAY_MAX_MS:-1000}
+      SCRAPER_DELAY_MIN_MS: ${SCRAPER_DELAY_MIN_MS:-100}
+      SCRAPER_DELAY_MAX_MS: ${SCRAPER_DELAY_MAX_MS:-250}
       SCRAPER_SECTION_ID: ${SCRAPER_SECTION_ID:-2500}
-      API_BASE_URL: ${API_BASE_URL:-https://vehicle-specs.coches.net}
+      API_BASE_URL: ${API_BASE_URL:-https://web.gw.coches.net}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Playwright / perfil persistente para el crawl de fichas técnicas.
+      # headless=false + xvfb-run en el Dockerfile = Chromium "headed" en display virtual.
+      PLAYWRIGHT_PROFILE_PATH: ${PLAYWRIGHT_PROFILE_PATH:-/app/playwright-profile}
+      PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-false}
+      PLAYWRIGHT_NAVIGATION_TIMEOUT_MS: ${PLAYWRIGHT_NAVIGATION_TIMEOUT_MS:-45000}
+      PLAYWRIGHT_CHALLENGE_WAIT_MS: ${PLAYWRIGHT_CHALLENGE_WAIT_MS:-20000}
+      SPECS_CRAWL_DELAY_MIN_MS: ${SPECS_CRAWL_DELAY_MIN_MS:-500}
+      SPECS_CRAWL_DELAY_MAX_MS: ${SPECS_CRAWL_DELAY_MAX_MS:-1500}
+      SPECS_MAX_CONSECUTIVE_BOT_ERRORS: ${SPECS_MAX_CONSECUTIVE_BOT_ERRORS:-3}
     ports:
-      - "3000:3000"
+      - "4000:4000"
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      # Volumen nombrado (no bind host) para evitar conflictos de permisos con USER nodejs
+      - playwright_profile:/app/playwright-profile
     networks:
       - coches_network
     restart: unless-stopped
 
 volumes:
   postgres_data:
+    driver: local
+  playwright_profile:
     driver: local
 
 networks:

@@ -36,6 +36,7 @@ export interface Year {
 
 export interface Version {
   id: number;
+  version_id: number;
   make_id: number;
   model_id: number;
   body_type_id: number;
@@ -45,9 +46,12 @@ export interface Version {
   created_at: string;
 }
 
+export type CrawlType = 'catalog' | 'specs';
+
 export interface CrawlLog {
   id: number;
   crawl_id: string;
+  crawl_type: CrawlType;
   status: 'running' | 'completed' | 'failed';
   processed_count: number;
   total_count: number;
@@ -67,6 +71,10 @@ export interface CrawlStatus {
   errors: number;
   startedAt: string;
   completedAt: string | null;
+}
+
+export interface SpecsCrawlStatus extends CrawlStatus {
+  message: string | null;
 }
 
 export interface VehiclesResponse {

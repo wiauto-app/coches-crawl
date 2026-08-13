@@ -3,9 +3,10 @@ import express from 'express';
 import crawlRoutes from './routes/crawlRoutes.js';
 import { logger } from './utils/logger.js';
 import { closePool } from './db/connection.js';
+import { closePlaywrightContext } from './scrapers/playwrightClient.js';
 
 const app = express();
-const port = parseInt(process.env.PORT || '3000', 10);
+const port = parseInt(process.env.PORT || '4000', 10);
 
 // Middleware
 app.use(express.json());
@@ -48,17 +49,20 @@ app.use((err: Error, req: express.Request, res: express.Response) => {
   });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully...');
+const shutdown = async (signal: string): Promise<void> => {
+  logger.info(`${signal} received, shutting down gracefully...`);
+  await closePlaywrightContext();
   await closePool();
   process.exit(0);
+};
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  void shutdown('SIGTERM');
 });
 
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully...');
-  await closePool();
-  process.exit(0);
+process.on('SIGINT', () => {
+  void shutdown('SIGINT');
 });
 
 const server = app.listen(port, () => {
