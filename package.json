@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsup src/server.ts --format esm --out-dir dist",
+    "build": "tsup src/server.ts --format esm --out-dir dist && cp src/sync/merge-catalog.sql dist/merge-catalog.sql",
     "start": "node dist/server.js",
     "db:init": "psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f src/db/schema.sql",
     "lint": "eslint src --ext .ts",
@@ -15,6 +15,7 @@
   "dependencies": {
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "node-cron": "^4.6.0",
     "pg": "^8.11.2",
     "playwright": "^1.61.1",
     "uuid": "^9.0.1"

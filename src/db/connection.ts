@@ -1,16 +1,36 @@
 import { Pool, PoolClient } from 'pg';
 import { logger } from '../utils/logger.js';
 
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432', 10),
-  database: process.env.DB_NAME || 'coches_db',
-  user: process.env.DB_USER || 'coches_user',
-  password: process.env.DB_PASSWORD || 'coches_password_dev',
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
+const DB_SCHEMA = process.env.DB_SCHEMA || 'crawl';
+
+if (!/^[a-z_][a-z0-9_]*$/.test(DB_SCHEMA)) {
+  throw new Error(`DB_SCHEMA inválido: ${DB_SCHEMA}`);
+}
+
+const poolMax = parseInt(process.env.DB_POOL_MAX || '5', 10);
+
+// search_path: tablas del crawler en `crawl`, catálogo de wiauto en `public`.
+const searchPathOption = `-c search_path=${DB_SCHEMA},public`;
+
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      options: searchPathOption,
+      max: poolMax,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+    })
+  : new Pool({
+      host: process.env.DB_HOST || 'localhost',
+      port: parseInt(process.env.DB_PORT || '5435', 10),
+      database: process.env.DB_NAME || 'coches_db',
+      user: process.env.DB_USER || 'coches_user',
+      password: process.env.DB_PASSWORD || 'coches_password_dev',
+      options: searchPathOption,
+      max: poolMax,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+    });
 
 pool.on('error', (err) => {
   logger.error('Unexpected error on idle client', { error: err.message });

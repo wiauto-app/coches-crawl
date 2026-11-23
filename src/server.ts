@@ -4,6 +4,10 @@ import crawlRoutes from './routes/crawlRoutes.js';
 import { logger } from './utils/logger.js';
 import { closePool } from './db/connection.js';
 import { closePlaywrightContext } from './scrapers/playwrightClient.js';
+import {
+  startWeeklyCatalogSync,
+  stopWeeklyCatalogSync,
+} from './jobs/weeklyCatalogSync.js';
 
 const app = express();
 const port = parseInt(process.env.PORT || '4001', 10);
@@ -51,6 +55,7 @@ app.use((err: Error, req: express.Request, res: express.Response) => {
 
 const shutdown = async (signal: string): Promise<void> => {
   logger.info(`${signal} received, shutting down gracefully...`);
+  await stopWeeklyCatalogSync();
   await closePlaywrightContext();
   await closePool();
   process.exit(0);
@@ -68,6 +73,7 @@ process.on('SIGINT', () => {
 const server = app.listen(port, () => {
   logger.info(`Server running on http://localhost:${port}`);
   logger.info(`Environment: ${process.env.NODE_ENV}`);
+  startWeeklyCatalogSync();
 });
 
 export default server;

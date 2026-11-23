@@ -12,6 +12,8 @@ import type {
   ScraperFormResponse,
 } from '../types/index.js';
 
+export type CatalogCrawlStatus = 'completed' | 'failed';
+
 interface CrawlContext {
   crawlId: string;
   processed: number;
@@ -316,14 +318,21 @@ export class VehiclesScraper {
     }
   }
 
-  async startCrawl(): Promise<string> {
+  /**
+   * Crea el crawl log y arranca el crawl en background.
+   * `done` resuelve con el estado final (nunca rechaza).
+   */
+  async beginCrawl(): Promise<{
+    crawlId: string;
+    done: Promise<CatalogCrawlStatus>;
+  }> {
     const crawlId = uuidv4();
 
     try {
       await query(
         `
-        INSERT INTO crawl_logs (crawl_id, status, processed_count, total_count, error_count, message)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO crawl_logs (crawl_id, crawl_type, status, processed_count, total_count, error_count, message)
+        VALUES ($1, 'catalog', $2, $3, $4, $5, $6)
         `,
         [crawlId, 'running', 0, 0, 0, 'Crawl started']
       );
@@ -336,18 +345,18 @@ export class VehiclesScraper {
       throw error;
     }
 
-    // Start crawl in background (non-blocking)
-    this.runCrawl(crawlId).catch((error) => {
+    const done = this.runCrawl(crawlId).catch((error): CatalogCrawlStatus => {
       logger.error('Crawl failed', {
         crawlId,
         error: error instanceof Error ? error.message : 'Unknown error',
       });
+      return 'failed';
     });
 
-    return crawlId;
+    return { crawlId, done };
   }
 
-  private async runCrawl(crawlId: string): Promise<void> {
+  private async runCrawl(crawlId: string): Promise<CatalogCrawlStatus> {
     const context: CrawlContext = {
       crawlId,
       processed: 0,
@@ -539,6 +548,8 @@ export class VehiclesScraper {
         errors: context.errors,
         duration: Date.now() - context.startedAt.getTime(),
       });
+
+      return 'completed';
     } catch (error) {
       logger.error(`Crawl failed: ${crawlId}`, {
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -552,6 +563,8 @@ export class VehiclesScraper {
         `,
         ['failed', error instanceof Error ? error.message : 'Unknown error', crawlId]
       );
+
+      return 'failed';
     }
   }
 }

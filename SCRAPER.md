@@ -89,7 +89,6 @@ uvicorn coches_scraper.services.monitor_api:app --host 0.0.0.0 --port 8001
 
 ## Tablas relevantes
 
-- `crawl_jobs` — cola reanudable
 - `technical_sheets` — ficha denormalizada
 - `versions` + `version_specifications` — compatible con import Wiauto
 - `makes` / `models` / `body_types` / `fuel_types` / `years`

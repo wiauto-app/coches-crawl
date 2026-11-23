@@ -12,6 +12,92 @@ A high-performance TypeScript backend for scraping vehicle specifications from c
 - **Comprehensive Logging**: Structured logging at all critical points
 - **Strict TypeScript**: Full strict mode compilation
 
+## Producción: sync semanal con la DB de wiauto
+
+El crawler corre como contenedor junto al backend, comparte la red Docker `wiauto-network` y escribe en la DB de producción de wiauto:
+
+1. **Crawl** de catálogo (JSON API de coches.net) → tablas del schema `crawl` (`crawl.makes`, `crawl.models`, `crawl.versions`, ...).
+2. **Merge** transaccional (`src/sync/merge-catalog.sql`) → catálogo público `make`, `model`, `year`, `body_type`, `fuel_type`, `version`. Solo `INSERT`/`UPDATE`, nunca borra; preserva `vehicles.version_id`. Si algo falla, rollback completo.
+3. **Cron** (`node-cron`) dispara crawl + merge cada lunes 03:00 Europe/Madrid. Un `pg_advisory_lock` impide ejecuciones solapadas.
+
+### Setup (una sola vez)
+
+1. Backend: aplicar la migración `CrawlSchema1794700000000` (crea schema `crawl` + `crawl.catalog_slugify`):
+
+   ```bash
+   pnpm migration:run   # en wiauto-backend
+   ```
+
+2. Crear el rol dedicado como superuser (`docker exec -it wiauto-postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB>`):
+
+   ```sql
+   CREATE ROLE wiauto_crawler LOGIN PASSWORD '<secret>';
+   GRANT USAGE, CREATE ON SCHEMA crawl TO wiauto_crawler;
+   GRANT ALL ON ALL TABLES IN SCHEMA crawl TO wiauto_crawler;
+   GRANT ALL ON ALL SEQUENCES IN SCHEMA crawl TO wiauto_crawler;
+   GRANT EXECUTE ON FUNCTION crawl.catalog_slugify(text) TO wiauto_crawler;
+   GRANT USAGE ON SCHEMA public TO wiauto_crawler;
+   GRANT SELECT, INSERT, UPDATE ON make, model, year, body_type, fuel_type, version TO wiauto_crawler;
+   GRANT USAGE, SELECT, UPDATE ON SEQUENCE
+     make_id_seq, model_id_seq, year_id_seq, body_type_id_seq, fuel_type_id_seq, version_id_seq
+     TO wiauto_crawler;
+   GRANT SELECT ON vehicles TO wiauto_crawler; -- chequeo de integridad del merge
+   GRANT TEMP ON DATABASE <POSTGRES_DB> TO wiauto_crawler;
+   ```
+
+   Sin `DELETE` ni acceso a otras tablas (users, pagos, etc.). Si los nombres de secuencia difieren, verlos con `SELECT pg_get_serial_sequence('version','id');`.
+
+3. Backup antes del primer merge en prod:
+
+   ```bash
+   docker exec wiauto-postgres pg_dump -U <POSTGRES_USER> -d <POSTGRES_DB> \
+     -t make -t model -t year -t body_type -t fuel_type -t version -t vehicles \
+     -Fc > catalog-backup-$(date +%Y%m%d).dump
+   ```
+
+### Variables (`.env` junto al `docker-compose.yml`)
+
+| Variable | Default | Descripción |
+| --- | --- | --- |
+| `CRAWLER_DB_PASSWORD` | — (requerida) | Password de `wiauto_crawler`. URL-encode si tiene caracteres especiales (`@`, `:`, `/`, `#`). |
+| `WIAUTO_DB_NAME` | — (requerida) | Mismo valor que `POSTGRES_DB` del backend. |
+| `CRAWLER_DB_USER` | `wiauto_crawler` | |
+| `WIAUTO_DB_HOST` | `postgres` | Servicio Postgres del backend dentro de la red (vale para prod y dev). |
+| `WIAUTO_NETWORK` | `wiauto-network` | Red Docker del backend. Con `dev.yml` es `wiauto-backend_wiauto-network`. |
+| `CATALOG_CRON` | `0 3 * * 1` | Expresión cron. |
+| `CATALOG_CRON_TZ` | `Europe/Madrid` | |
+| `CATALOG_CRON_ENABLED` | `true` | `false` desactiva el cron (endpoints manuales siguen activos). |
+| `DB_POOL_MAX` | `5` | Conexiones máximas del crawler. |
+
+Fuera de Docker se puede usar `DATABASE_URL` directamente; si no está, se usan `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD` (Postgres local).
+
+### Levantar
+
+```bash
+# 1. Backend primero (crea la red wiauto-network)
+cd ../wiauto-backend && docker compose up -d
+# 2. Crawler
+cd ../coches-net-crawl && docker compose up -d --build
+docker network inspect wiauto-network --format '{{range .Containers}}{{.Name}} {{end}}'
+```
+
+El puerto 4001 queda publicado solo en `127.0.0.1` (endpoints sin auth).
+
+### Endpoints de sync
+
+| Método | Ruta | Qué hace |
+| --- | --- | --- |
+| `POST` | `/api/sync/catalog` | Crawl + merge en background (202). 409 si ya hay un job. |
+| `POST` | `/api/sync/merge` | Solo merge, síncrono (200/500). |
+| `POST` | `/api/crawl` | Solo crawl a `crawl.*`, sin merge. |
+| `GET` | `/api/sync/status` | Job activo + último crawl y último merge. |
+
+Historial en `crawl.crawl_logs` (`crawl_type` = `catalog` \| `merge` \| `specs`). El `message` del merge guarda el resumen JSON (filas insertadas/actualizadas por entidad y totales).
+
+### Dev local
+
+Postgres propio del crawler: `docker compose --profile local up -d postgres` y correr con `npm run dev` usando `DB_*`. Para probar contra la DB de wiauto de desarrollo (`wiauto-backend/dev.yml`, puerto 5433): `DATABASE_URL=postgres://wiauto_crawler:<pwd>@localhost:5433/wiauto npm run dev`.
+
 ## Tech Stack
 
 - **Runtime**: Node.js 20+

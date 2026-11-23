@@ -24,6 +24,7 @@ FROM mcr.microsoft.com/playwright:v1.61.1-jammy
 WORKDIR /app
 
 ENV NODE_ENV=production \
+    TZ=Europe/Madrid \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_PROFILE_PATH=/app/playwright-profile \
     PLAYWRIGHT_HEADLESS=true
@@ -51,9 +52,9 @@ USER nodejs
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:4000/health', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"
+  CMD node -e "require('http').get('http://localhost:4001/health', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"
 
-EXPOSE 4000
+EXPOSE 4001
 
 ENTRYPOINT ["dumb-init", "--"]
 # -a elige un display libre; -s define resolución del framebuffer virtual

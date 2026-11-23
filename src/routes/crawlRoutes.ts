@@ -1,11 +1,16 @@
 import { Router, Request, Response } from 'express';
-import { VehiclesScraper } from '../scrapers/vehiclesScraper.js';
 import {
   startSpecsCrawl,
   type StartSpecsCrawlOptions,
 } from '../scrapers/technicalSheetScraper.js';
 import { query, queryOne } from '../db/connection.js';
 import { logger } from '../utils/logger.js';
+import {
+  CatalogJobBusyError,
+  getActiveCatalogJob,
+  runMergeOnly,
+  startCatalogJob,
+} from '../sync/catalogSync.js';
 import type {
   CrawlStatus,
   CrawlLog,
@@ -16,9 +21,7 @@ import type {
 import type { VersionSpecificationRow } from '../types/technicalSheet.js';
 
 const router = Router();
-let currentCrawlId: string | null = null;
 let currentSpecsCrawlId: string | null = null;
-const scraper = new VehiclesScraper();
 
 const mapCrawlLogToSpecsStatus = (log: CrawlLog): SpecsCrawlStatus => ({
   crawlId: log.crawl_id,
@@ -67,38 +70,87 @@ const parseStartSpecsCrawlOptions = (
   };
 };
 
-// POST /api/crawl - Start a new crawl
-router.post('/crawl', async (req: Request, res: Response): Promise<void> => {
-  try {
-    // Check if crawl is already in progress
-    if (currentCrawlId) {
-      const log = await queryOne<CrawlLog>(
-        'SELECT * FROM crawl_logs WHERE crawl_id = $1',
-        [currentCrawlId]
-      );
+const respondBusy = (res: Response, error: CatalogJobBusyError): void => {
+  res.status(409).json({
+    error: error.message,
+    active: error.active,
+  });
+};
 
-      if (log && log.status === 'running') {
-        res.status(409).json({
-          error: 'Crawl already in progress',
-          crawlId: currentCrawlId,
+const startCatalogJobHandler =
+  (kind: 'crawl' | 'sync') =>
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const { crawlId, done } = await startCatalogJob(kind);
+
+      void done.then((result) => {
+        logger.info(`Catalog ${kind} finished`, {
+          crawlId: result.crawlId,
+          crawlStatus: result.crawlStatus,
+          merge: result.merge?.status ?? null,
         });
+      });
+
+      res.status(202).json({
+        crawlId,
+        kind,
+        status: 'started',
+        startedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      if (error instanceof CatalogJobBusyError) {
+        respondBusy(res, error);
         return;
       }
+      logger.error(`POST catalog ${kind} failed`, {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      res.status(500).json({
+        error: `Failed to start catalog ${kind}`,
+        message: error instanceof Error ? error.message : 'Unknown error',
+      });
     }
+  };
 
-    currentCrawlId = await scraper.startCrawl();
+// POST /api/crawl - Crawl de catálogo (solo schema crawl, sin merge)
+router.post('/crawl', startCatalogJobHandler('crawl'));
 
-    res.status(202).json({
-      crawlId: currentCrawlId,
-      status: 'started',
-      startedAt: new Date().toISOString(),
-    });
+// POST /api/sync/catalog - Crawl de catálogo + merge al catálogo de wiauto
+router.post('/sync/catalog', startCatalogJobHandler('sync'));
+
+// POST /api/sync/merge - Solo merge (síncrono) de crawl.* al catálogo de wiauto
+router.post('/sync/merge', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const result = await runMergeOnly();
+    res.status(result.status === 'completed' ? 200 : 500).json(result);
   } catch (error) {
-    logger.error('POST /crawl failed', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    if (error instanceof CatalogJobBusyError) {
+      respondBusy(res, error);
+      return;
+    }
     res.status(500).json({
-      error: 'Failed to start crawl',
+      error: 'Failed to run merge',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+// GET /api/sync/status - Job activo + último crawl de catálogo y último merge
+router.get('/sync/status', async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const [lastCrawl, lastMerge] = await Promise.all([
+      queryOne<CrawlLog>(
+        `SELECT * FROM crawl_logs WHERE crawl_type = 'catalog' ORDER BY id DESC LIMIT 1`
+      ),
+      queryOne<CrawlLog>(
+        `SELECT * FROM crawl_logs WHERE crawl_type = 'merge' ORDER BY id DESC LIMIT 1`
+      ),
+    ]);
+
+    res.json({ active: getActiveCatalogJob(), lastCrawl, lastMerge });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to get sync status',
       message: error instanceof Error ? error.message : 'Unknown error',
     });
   }
@@ -111,7 +163,7 @@ router.get('/crawl/status', async (req: Request, res: Response): Promise<void> =
 
     if (!crawlId) {
       const log = await queryOne<CrawlLog>(
-        'SELECT * FROM crawl_logs ORDER BY id DESC LIMIT 1',
+        `SELECT * FROM crawl_logs WHERE crawl_type = 'catalog' ORDER BY id DESC LIMIT 1`,
       );
       if (!log) {
         res.status(404).json({ error: 'Crawl not found' });

@@ -1,7 +1,10 @@
 services:
+  # Postgres propio solo para desarrollo local: `docker compose --profile local up -d postgres`.
+  # En producción el crawler usa la DB de wiauto vía la red externa wiauto-network.
   postgres:
     image: postgres:15-alpine
     container_name: coches_postgres
+    profiles: ["local"]
     environment:
       POSTGRES_DB: ${DB_NAME:-coches_db}
       POSTGRES_USER: ${DB_USER:-coches_user}
@@ -27,13 +30,19 @@ services:
       dockerfile: Dockerfile
     container_name: coches_app
     environment:
-      NODE_ENV: ${NODE_ENV:-development}
+      NODE_ENV: ${NODE_ENV:-production}
       PORT: ${PORT:-4001}
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: ${DB_NAME:-coches_db}
-      DB_USER: ${DB_USER:-coches_user}
-      DB_PASSWORD: ${DB_PASSWORD:-coches_password_dev}
+      TZ: ${TZ:-Europe/Madrid}
+      # DB de wiauto. Host `postgres` = nombre del servicio en ambos compose del backend
+      # (prod: contenedor wiauto-postgres; dev: wiauto-backend-postgres-1).
+      # Rol dedicado con permisos mínimos; ver README.
+      DATABASE_URL: postgres://${CRAWLER_DB_USER:-wiauto_crawler}:${CRAWLER_DB_PASSWORD:?CRAWLER_DB_PASSWORD requerido}@${WIAUTO_DB_HOST:-postgres}:5432/${WIAUTO_DB_NAME:?WIAUTO_DB_NAME requerido}
+      DB_SCHEMA: ${DB_SCHEMA:-crawl}
+      DB_POOL_MAX: ${DB_POOL_MAX:-5}
+      # Cron semanal: crawl de catálogo + merge al catálogo de wiauto.
+      CATALOG_CRON_ENABLED: ${CATALOG_CRON_ENABLED:-true}
+      CATALOG_CRON: ${CATALOG_CRON:-0 3 * * 1}
+      CATALOG_CRON_TZ: ${CATALOG_CRON_TZ:-Europe/Madrid}
       SCRAPER_TIMEOUT_MS: ${SCRAPER_TIMEOUT_MS:-30000}
       SCRAPER_RETRY_ATTEMPTS: ${SCRAPER_RETRY_ATTEMPTS:-3}
       SCRAPER_DELAY_MIN_MS: ${SCRAPER_DELAY_MIN_MS:-100}
@@ -50,16 +59,14 @@ services:
       SPECS_CRAWL_DELAY_MIN_MS: ${SPECS_CRAWL_DELAY_MIN_MS:-500}
       SPECS_CRAWL_DELAY_MAX_MS: ${SPECS_CRAWL_DELAY_MAX_MS:-1500}
       SPECS_MAX_CONSECUTIVE_BOT_ERRORS: ${SPECS_MAX_CONSECUTIVE_BOT_ERRORS:-3}
+    # Solo accesible desde el host (endpoints manuales sin auth).
     ports:
-      - "4001:4001"
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - "127.0.0.1:${CRAWLER_HOST_PORT:-4001}:4001"
     volumes:
       # Volumen nombrado (no bind host) para evitar conflictos de permisos con USER nodejs
       - playwright_profile:/app/playwright-profile
     networks:
-      - coches_network
+      - wiauto-network
     restart: unless-stopped
 
 volumes:
@@ -71,3 +78,9 @@ volumes:
 networks:
   coches_network:
     driver: bridge
+  # Red del backend (levantarlo primero):
+  #   prod (docker-compose.yml) -> wiauto-network
+  #   dev  (dev.yml)            -> wiauto-backend_wiauto-network
+  wiauto-network:
+    external: true
+    name: ${WIAUTO_NETWORK:-wiauto-network}
