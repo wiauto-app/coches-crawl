@@ -38,7 +38,7 @@ services:
       # Rol dedicado con permisos mínimos; ver README.
       DATABASE_URL: postgres://${CRAWLER_DB_USER:-wiauto_crawler}:${CRAWLER_DB_PASSWORD:?CRAWLER_DB_PASSWORD requerido}@${WIAUTO_DB_HOST:-postgres}:5432/${WIAUTO_DB_NAME:?WIAUTO_DB_NAME requerido}
       DB_SCHEMA: ${DB_SCHEMA:-crawl}
-      DB_POOL_MAX: ${DB_POOL_MAX:-5}
+      DB_POOL_MAX: ${DB_POOL_MAX:-10}
       # Cron semanal: crawl de catálogo + merge al catálogo de wiauto.
       CATALOG_CRON_ENABLED: ${CATALOG_CRON_ENABLED:-true}
       CATALOG_CRON: ${CATALOG_CRON:-0 3 * * 1}
@@ -48,6 +48,9 @@ services:
       SCRAPER_DELAY_MIN_MS: ${SCRAPER_DELAY_MIN_MS:-100}
       SCRAPER_DELAY_MAX_MS: ${SCRAPER_DELAY_MAX_MS:-250}
       SCRAPER_SECTION_ID: ${SCRAPER_SECTION_ID:-2500}
+      # Crawl de catálogo en paralelo: modelos simultáneos y tope global de req/s a coches.net.
+      SCRAPER_CONCURRENCY: ${SCRAPER_CONCURRENCY:-4}
+      SCRAPER_MAX_RPS: ${SCRAPER_MAX_RPS:-8}
       API_BASE_URL: ${API_BASE_URL:-https://web.gw.coches.net}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Playwright / perfil persistente para el crawl de fichas técnicas.

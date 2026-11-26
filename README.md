@@ -17,12 +17,12 @@ A high-performance TypeScript backend for scraping vehicle specifications from c
 El crawler corre como contenedor junto al backend, comparte la red Docker `wiauto-network` y escribe en la DB de producción de wiauto:
 
 1. **Crawl** de catálogo (JSON API de coches.net) → tablas del schema `crawl` (`crawl.makes`, `crawl.models`, `crawl.versions`, ...).
-2. **Merge** transaccional (`src/sync/merge-catalog.sql`) → catálogo público `make`, `model`, `year`, `body_type`, `fuel_type`, `version`. Solo `INSERT`/`UPDATE`, nunca borra; preserva `vehicles.version_id`. Si algo falla, rollback completo.
+2. **Merge** transaccional (`src/sync/merge-catalog.sql`) → catálogo público `make`, `model`, `year`, `body_type`, `fuel_type`, `version`, `version_year`. Solo `INSERT`/`UPDATE`, nunca borra; preserva `vehicles.version_id`. Si algo falla, rollback completo.
 3. **Cron** (`node-cron`) dispara crawl + merge cada lunes 03:00 Europe/Madrid. Un `pg_advisory_lock` impide ejecuciones solapadas.
 
 ### Setup (una sola vez)
 
-1. Backend: aplicar la migración `CrawlSchema1794700000000` (crea schema `crawl` + `crawl.catalog_slugify`):
+1. Backend: aplicar las migraciones `CrawlSchema1794700000000` (crea schema `crawl` + `crawl.catalog_slugify`) y `VersionYearManyToMany` (crea `crawl.version_years` y `public.version_year`):
 
    ```bash
    pnpm migration:run   # en wiauto-backend
@@ -38,6 +38,7 @@ El crawler corre como contenedor junto al backend, comparte la red Docker `wiaut
    GRANT EXECUTE ON FUNCTION crawl.catalog_slugify(text) TO wiauto_crawler;
    GRANT USAGE ON SCHEMA public TO wiauto_crawler;
    GRANT SELECT, INSERT, UPDATE ON make, model, year, body_type, fuel_type, version TO wiauto_crawler;
+   GRANT SELECT, INSERT ON version_year TO wiauto_crawler; -- N:M versión ↔ año (solo inserta)
    GRANT USAGE, SELECT, UPDATE ON SEQUENCE
      make_id_seq, model_id_seq, year_id_seq, body_type_id_seq, fuel_type_id_seq, version_id_seq
      TO wiauto_crawler;
@@ -45,13 +46,15 @@ El crawler corre como contenedor junto al backend, comparte la red Docker `wiaut
    GRANT TEMP ON DATABASE <POSTGRES_DB> TO wiauto_crawler;
    ```
 
+   Si el rol ya existía antes de la migración `VersionYearManyToMany`, vuelve a ejecutar `GRANT ALL ON ALL TABLES IN SCHEMA crawl TO wiauto_crawler;` (cubre `crawl.version_years`, el `GRANT ... ON ALL TABLES` solo aplica a tablas que ya existen) y el `GRANT SELECT, INSERT ON version_year`.
+
    Sin `DELETE` ni acceso a otras tablas (users, pagos, etc.). Si los nombres de secuencia difieren, verlos con `SELECT pg_get_serial_sequence('version','id');`.
 
 3. Backup antes del primer merge en prod:
 
    ```bash
    docker exec wiauto-postgres pg_dump -U <POSTGRES_USER> -d <POSTGRES_DB> \
-     -t make -t model -t year -t body_type -t fuel_type -t version -t vehicles \
+     -t make -t model -t year -t body_type -t fuel_type -t version -t version_year -t vehicles \
      -Fc > catalog-backup-$(date +%Y%m%d).dump
    ```
 
@@ -67,7 +70,9 @@ El crawler corre como contenedor junto al backend, comparte la red Docker `wiaut
 | `CATALOG_CRON` | `0 3 * * 1` | Expresión cron. |
 | `CATALOG_CRON_TZ` | `Europe/Madrid` | |
 | `CATALOG_CRON_ENABLED` | `true` | `false` desactiva el cron (endpoints manuales siguen activos). |
-| `DB_POOL_MAX` | `5` | Conexiones máximas del crawler. |
+| `DB_POOL_MAX` | `10` | Conexiones máximas del crawler (>= `SCRAPER_CONCURRENCY` + margen). |
+| `SCRAPER_CONCURRENCY` | `4` | Modelos que el crawl de catálogo procesa en paralelo. `1` = secuencial. |
+| `SCRAPER_MAX_RPS` | `8` | Tope global de requests por segundo a coches.net (todos los workers). `0` = sin tope. Bájalo si aparecen 403/429. |
 
 Fuera de Docker se puede usar `DATABASE_URL` directamente; si no está, se usan `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD` (Postgres local).
 
@@ -210,6 +215,8 @@ SCRAPER_RETRY_ATTEMPTS=3        # Max retry attempts
 SCRAPER_DELAY_MIN_MS=500        # Min delay between requests
 SCRAPER_DELAY_MAX_MS=1000       # Max delay between requests
 SCRAPER_SECTION_ID=2500         # Vehicle section ID
+SCRAPER_CONCURRENCY=4           # Models crawled in parallel (catalog crawl)
+SCRAPER_MAX_RPS=8               # Global max requests/second to coches.net
 
 # API
 API_BASE_URL=https://vehicle-specs.coches.net
@@ -333,9 +340,16 @@ Response (200):
 - `model_id` - Foreign key to models
 - `body_type_id` - Foreign key to body_types
 - `fuel_type_id` - Foreign key to fuel_types
-- `year_id` - Foreign key to years
+- `year_id` - Legacy, nullable (los años van en `version_years`)
 - `name` - Version name/designation
 - `created_at` - Timestamp
+
+**version_years**: N:M versión ↔ año. Una versión de coches.net aparece en varios años (p. ej. la 103953 del León diésel en 2021, 2022, 2023, 2025 y 2026); el crawler inserta la versión una vez y un par por cada año en que aparece.
+- `version_id` - FK a `versions.version_id` (ID externo)
+- `year_id` - FK a `years.id`
+- PK `(version_id, year_id)`
+
+En el merge, cada par pasa a `public.version_year` y `version.year_id` queda como año por defecto (el más reciente).
 
 **crawl_logs**: Crawl job tracking
 - `id` - Primary key

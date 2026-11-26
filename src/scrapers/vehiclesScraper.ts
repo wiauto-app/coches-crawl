@@ -2,15 +2,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { RetryClient } from './retryClient.js';
 import { query, queryOne } from '../db/connection.js';
 import { logger } from '../utils/logger.js';
-import type {
-  Make,
-  Model,
-  BodyType,
-  FuelType,
-  Year,
-  Version,
-  ScraperFormResponse,
-} from '../types/index.js';
+import type { ScraperFormResponse } from '../types/index.js';
+import { PromiseCache, RateLimiter, runPool } from '../utils/concurrency.js';
 
 export type CatalogCrawlStatus = 'completed' | 'failed';
 
@@ -33,11 +26,39 @@ interface BodyTypeFormRow {
   name: string;
 }
 
+/** Contexto común de una lista de versiones (crawl.versions + version_years). */
+interface VersionListContext {
+  makeId: number;
+  modelId: number;
+  bodyTypeId: number;
+  fuelTypeId: number;
+  yearId: number;
+}
+
+/** Unidad de trabajo del pool: un modelo de una marca. */
+interface ModelTask {
+  make: ScraperFormResponse;
+  makeDbId: number;
+  model: ScraperFormResponse;
+}
+
 export class VehiclesScraper {
   private client: RetryClient;
   private sectionId: number;
   private delayMin: number;
   private delayMax: number;
+  /** Modelos procesados en paralelo. */
+  private concurrency: number;
+  /** Tope global de requests por segundo a coches.net (todos los workers). */
+  private rateLimiter: RateLimiter;
+
+  // Ids de crawl.* ya resueltos. Compartidos entre workers: la misma clave
+  // pedida a la vez reutiliza la misma promesa (sin carreras de insert).
+  private makeIds = new PromiseCache<number>();
+  private modelIds = new PromiseCache<number>();
+  private bodyTypeIds = new PromiseCache<number>();
+  private fuelTypeIds = new PromiseCache<number>();
+  private yearIds = new PromiseCache<number>();
 
   constructor() {
     const apiBaseUrl =
@@ -52,6 +73,13 @@ export class VehiclesScraper {
       process.env.SCRAPER_DELAY_MAX_MS || '250',
       10
     );
+    this.concurrency = Math.max(
+      1,
+      parseInt(process.env.SCRAPER_CONCURRENCY || '4', 10) || 1
+    );
+    this.rateLimiter = RateLimiter.perSecond(
+      parseFloat(process.env.SCRAPER_MAX_RPS || '8') || 0
+    );
   }
 
   private async delay(): Promise<void> {
@@ -62,6 +90,8 @@ export class VehiclesScraper {
   private async fetchFormDatalist(
     path: string
   ): Promise<Array<{ value: string; text: string }>> {
+    await this.delay();
+    await this.rateLimiter.acquire();
     const res = await this.client.get<ApiFormEnvelope>(path);
     return Array.isArray(res?.datalist) ? res.datalist : [];
   }
@@ -121,197 +151,158 @@ export class VehiclesScraper {
     }
   }
 
-  private async getOrCreateMake(
-    section1Id: number,
-    name: string
+  /**
+   * SELECT y, si no existe, INSERT ... ON CONFLICT DO NOTHING. Si otro
+   * proceso insertó entre medio, el INSERT no devuelve fila y se relee.
+   */
+  private async selectOrInsertId(
+    label: string,
+    selectSql: string,
+    selectParams: unknown[],
+    insertSql: string,
+    insertParams: unknown[]
   ): Promise<number> {
     try {
-      const existing = await queryOne<{ id: number }>(
-        'SELECT id FROM makes WHERE section_1_id = $1',
-        [section1Id]
-      );
-
+      const existing = await queryOne<{ id: number }>(selectSql, selectParams);
       if (existing) {
         return existing.id;
       }
 
-      const inserted = await queryOne<{ id: number }>(
-        'INSERT INTO makes (section_1_id, name) VALUES ($1, $2) RETURNING id',
-        [section1Id, name]
-      );
-
-      if (!inserted) {
-        throw new Error('Failed to insert make');
+      const inserted = await queryOne<{ id: number }>(insertSql, insertParams);
+      if (inserted) {
+        return inserted.id;
       }
 
-      return inserted.id;
+      const raced = await queryOne<{ id: number }>(selectSql, selectParams);
+      if (!raced) {
+        throw new Error(`Failed to insert ${label}`);
+      }
+      return raced.id;
     } catch (error) {
-      logger.error('Error in getOrCreateMake', {
-        section1Id,
-        name,
+      logger.error(`Error in getOrCreate ${label}`, {
+        params: selectParams,
         error: error instanceof Error ? error.message : 'Unknown error',
       });
       throw error;
     }
   }
 
-  private async getOrCreateModel(
+  private getOrCreateMake(section1Id: number, name: string): Promise<number> {
+    return this.makeIds.get(String(section1Id), () =>
+      this.selectOrInsertId(
+        'make',
+        'SELECT id FROM makes WHERE section_1_id = $1',
+        [section1Id],
+        `INSERT INTO makes (section_1_id, name) VALUES ($1, $2)
+         ON CONFLICT (section_1_id) DO NOTHING RETURNING id`,
+        [section1Id, name]
+      )
+    );
+  }
+
+  private getOrCreateModel(
     makeId: number,
     modelId: number,
     name: string
   ): Promise<number> {
-    try {
-      const existing = await queryOne<{ id: number }>(
+    return this.modelIds.get(`${makeId}:${modelId}`, () =>
+      this.selectOrInsertId(
+        'model',
         'SELECT id FROM models WHERE make_id = $1 AND model_id = $2',
-        [makeId, modelId]
-      );
-
-      if (existing) {
-        return existing.id;
-      }
-
-      const inserted = await queryOne<{ id: number }>(
-        'INSERT INTO models (make_id, model_id, name) VALUES ($1, $2, $3) RETURNING id',
+        [makeId, modelId],
+        `INSERT INTO models (make_id, model_id, name) VALUES ($1, $2, $3)
+         ON CONFLICT (make_id, model_id) DO NOTHING RETURNING id`,
         [makeId, modelId, name]
-      );
-
-      if (!inserted) {
-        throw new Error('Failed to insert model');
-      }
-
-      return inserted.id;
-    } catch (error) {
-      logger.error('Error in getOrCreateModel', {
-        makeId,
-        modelId,
-        name,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-      throw error;
-    }
+      )
+    );
   }
 
-  private async getOrCreateBodyType(
+  private getOrCreateBodyType(
     bodyTypeId: number,
     doors: number | null,
     name: string
   ): Promise<number> {
-    try {
-      const existing = await queryOne<{ id: number }>(
-        'SELECT id FROM body_types WHERE body_type_id = $1 AND doors = $2',
-        [bodyTypeId, doors]
-      );
-
-      if (existing) {
-        return existing.id;
-      }
-
-      const inserted = await queryOne<{ id: number }>(
-        'INSERT INTO body_types (body_type_id, doors, name) VALUES ($1, $2, $3) RETURNING id',
+    // doors puede ser NULL: IS NOT DISTINCT FROM para que NULL encuentre NULL.
+    return this.bodyTypeIds.get(`${bodyTypeId}:${doors ?? 'null'}`, () =>
+      this.selectOrInsertId(
+        'body type',
+        'SELECT id FROM body_types WHERE body_type_id = $1 AND doors IS NOT DISTINCT FROM $2',
+        [bodyTypeId, doors],
+        `INSERT INTO body_types (body_type_id, doors, name) VALUES ($1, $2, $3)
+         ON CONFLICT (body_type_id, doors) DO NOTHING RETURNING id`,
         [bodyTypeId, doors, name]
-      );
-
-      if (!inserted) {
-        throw new Error('Failed to insert body type');
-      }
-
-      return inserted.id;
-    } catch (error) {
-      logger.error('Error in getOrCreateBodyType', {
-        bodyTypeId,
-        doors,
-        name,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-      throw error;
-    }
+      )
+    );
   }
 
-  private async getOrCreateFuelType(
-    fuelId: number,
-    name: string
-  ): Promise<number> {
-    try {
-      const existing = await queryOne<{ id: number }>(
+  private getOrCreateFuelType(fuelId: number, name: string): Promise<number> {
+    return this.fuelTypeIds.get(String(fuelId), () =>
+      this.selectOrInsertId(
+        'fuel type',
         'SELECT id FROM fuel_types WHERE fuel_id = $1',
-        [fuelId]
-      );
-
-      if (existing) {
-        return existing.id;
-      }
-
-      const inserted = await queryOne<{ id: number }>(
-        'INSERT INTO fuel_types (fuel_id, name) VALUES ($1, $2) RETURNING id',
+        [fuelId],
+        `INSERT INTO fuel_types (fuel_id, name) VALUES ($1, $2)
+         ON CONFLICT (fuel_id) DO NOTHING RETURNING id`,
         [fuelId, name]
-      );
-
-      if (!inserted) {
-        throw new Error('Failed to insert fuel type');
-      }
-
-      return inserted.id;
-    } catch (error) {
-      logger.error('Error in getOrCreateFuelType', {
-        fuelId,
-        name,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-      throw error;
-    }
+      )
+    );
   }
 
-  private async getOrCreateYear(year: number): Promise<number> {
-    try {
-      const existing = await queryOne<{ id: number }>(
+  private getOrCreateYear(year: number): Promise<number> {
+    return this.yearIds.get(String(year), () =>
+      this.selectOrInsertId(
+        'year',
         'SELECT id FROM years WHERE year = $1',
+        [year],
+        `INSERT INTO years (year) VALUES ($1)
+         ON CONFLICT (year) DO NOTHING RETURNING id`,
         [year]
-      );
-
-      if (existing) {
-        return existing.id;
-      }
-
-      const inserted = await queryOne<{ id: number }>(
-        'INSERT INTO years (year) VALUES ($1) RETURNING id',
-        [year]
-      );
-
-      if (!inserted) {
-        throw new Error('Failed to insert year');
-      }
-
-      return inserted.id;
-    } catch (error) {
-      logger.error('Error in getOrCreateYear', {
-        year,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-      throw error;
-    }
+      )
+    );
   }
 
-  private async insertVersion(
-    versionId: number,
-    makeId: number,
-    modelId: number,
-    bodyTypeId: number,
-    fuelTypeId: number,
-    yearId: number,
-    name: string
+  /**
+   * Inserta en lote las versiones de una lista (una vez por version_id
+   * externo) y sus pares versión–año. Una versión de coches.net aparece en
+   * varios años, así que cada lista de año suma sus pares en
+   * crawl.version_years.
+   */
+  private async insertVersions(
+    versions: ScraperFormResponse[],
+    ctx: VersionListContext
   ): Promise<void> {
+    if (versions.length === 0) {
+      return;
+    }
+
+    const versionIds = versions.map((v) => v.id);
+    const names = versions.map((v) => v.name);
+
     try {
       await query(
         `
         INSERT INTO versions
-        (version_id, make_id, model_id, body_type_id, fuel_type_id, year_id, name)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        (version_id, make_id, model_id, body_type_id, fuel_type_id, name)
+        SELECT v.version_id, $3, $4, $5, $6, v.name
+        FROM unnest($1::int[], $2::text[]) AS v(version_id, name)
         ON CONFLICT (version_id) DO NOTHING
         `,
-        [versionId, makeId, modelId, bodyTypeId, fuelTypeId, yearId, name]
+        [versionIds, names, ctx.makeId, ctx.modelId, ctx.bodyTypeId, ctx.fuelTypeId]
+      );
+
+      await query(
+        `
+        INSERT INTO version_years (version_id, year_id)
+        SELECT DISTINCT v.version_id, $2::int
+        FROM unnest($1::int[]) AS v(version_id)
+        ON CONFLICT DO NOTHING
+        `,
+        [versionIds, ctx.yearId]
       );
     } catch (error) {
-      logger.error('Error in insertVersion', {
+      logger.error('Error in insertVersions', {
+        ...ctx,
+        count: versions.length,
         error: error instanceof Error ? error.message : 'Unknown error',
       });
       throw error;
@@ -356,6 +347,98 @@ export class VehiclesScraper {
     return { crawlId, done };
   }
 
+  private clearCaches(): void {
+    this.makeIds.clear();
+    this.modelIds.clear();
+    this.bodyTypeIds.clear();
+    this.fuelTypeIds.clear();
+    this.yearIds.clear();
+  }
+
+  /** Recorre carrocería → combustible → año → versiones de un modelo. */
+  private async crawlModel(task: ModelTask, context: CrawlContext): Promise<void> {
+    const { make, makeDbId, model } = task;
+    const modelId = await this.getOrCreateModel(makeDbId, model.id, model.name);
+
+    logger.debug(`Fetching body types for model: ${make.name} ${model.name}`);
+    const bodyTypes = this.mapBodyTypeRows(
+      await this.fetchFormDatalist(
+        `/vehicle-specs/v1/body-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}`
+      )
+    );
+
+    for (const bodyTypeData of bodyTypes) {
+      try {
+        const bodyTypeId = bodyTypeData.id;
+        const doors = bodyTypeData.doors;
+        const bodyTypeDbId = await this.getOrCreateBodyType(
+          bodyTypeId,
+          doors,
+          bodyTypeData.name
+        );
+
+        const fuelTypes = this.mapFormRows(
+          await this.fetchFormDatalist(
+            `/vehicle-specs/v1/fuel-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+          )
+        );
+
+        for (const fuelType of fuelTypes) {
+          try {
+            const fuelTypeId = await this.getOrCreateFuelType(
+              fuelType.id,
+              fuelType.name
+            );
+
+            const years = this.mapFormRows(
+              await this.fetchFormDatalist(
+                `/vehicle-specs/v1/years/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+              )
+            );
+
+            for (const yearData of years) {
+              try {
+                const yearDbId = await this.getOrCreateYear(yearData.id);
+
+                const versions = this.mapFormRows(
+                  await this.fetchFormDatalist(
+                    `/vehicle-specs/v1/versions/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&year=${yearData.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
+                  )
+                );
+
+                await this.insertVersions(versions, {
+                  makeId: makeDbId,
+                  modelId,
+                  bodyTypeId: bodyTypeDbId,
+                  fuelTypeId,
+                  yearId: yearDbId,
+                });
+              } catch (error) {
+                context.errors++;
+                logger.error(
+                  `Error processing year: ${make.name} ${model.name} ${yearData.id}`,
+                  { error: error instanceof Error ? error.message : 'Unknown error' }
+                );
+              }
+            }
+          } catch (error) {
+            context.errors++;
+            logger.error(
+              `Error processing fuel type: ${make.name} ${model.name} ${fuelType.name}`,
+              { error: error instanceof Error ? error.message : 'Unknown error' }
+            );
+          }
+        }
+      } catch (error) {
+        context.errors++;
+        logger.error(
+          `Error processing body type: ${make.name} ${model.name} ${bodyTypeData.name}`,
+          { error: error instanceof Error ? error.message : 'Unknown error' }
+        );
+      }
+    }
+  }
+
   private async runCrawl(crawlId: string): Promise<CatalogCrawlStatus> {
     const context: CrawlContext = {
       crawlId,
@@ -366,172 +449,60 @@ export class VehiclesScraper {
     };
 
     try {
-      logger.info(`Running crawl: ${crawlId}`);
+      this.clearCaches();
+      logger.info(`Running crawl: ${crawlId}`, {
+        concurrency: this.concurrency,
+      });
 
-      // Step 1: Get all makes
+      // Paso 1: marcas
       logger.info('Fetching makes...');
       const makes = this.mapFormRows(
         await this.fetchFormDatalist(
           `/vehicle-specs/v1/makes/form?section1Id=${this.sectionId}`
         )
       );
-      context.total = makes.length;
       logger.info(`Found ${makes.length} makes`);
 
-      for (const make of makes) {
+      // Paso 2: modelos de cada marca, en paralelo. Arma la cola de trabajo.
+      const tasks: ModelTask[] = [];
+      await runPool(makes, this.concurrency, async (make) => {
         try {
-          await this.delay();
-          const makeId = await this.getOrCreateMake(make.id, make.name);
-
-          // Step 2: Get models for this make
-          logger.debug(`Fetching models for make: ${make.name}`);
+          const makeDbId = await this.getOrCreateMake(make.id, make.name);
           const models = this.mapFormRows(
             await this.fetchFormDatalist(
               `/vehicle-specs/v1/models/form?section1Id=${this.sectionId}&makeId=${make.id}`
             )
           );
-
           for (const model of models) {
-            try {
-              await this.delay();
-              const modelId = await this.getOrCreateModel(
-                makeId,
-                model.id,
-                model.name
-              );
-
-              // Step 3: Get body types for this model
-              logger.debug(
-                `Fetching body types for model: ${model.name}`
-              );
-              const bodyTypes = this.mapBodyTypeRows(
-                await this.fetchFormDatalist(
-                  `/vehicle-specs/v1/body-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}`
-                )
-              );
-
-              for (const bodyTypeData of bodyTypes) {
-                try {
-                  await this.delay();
-
-                  const bodyTypeId = bodyTypeData.id;
-                  const doors = bodyTypeData.doors;
-
-                  const bodyTypeDbId = await this.getOrCreateBodyType(
-                    bodyTypeId,
-                    doors,
-                    bodyTypeData.name
-                  );
-
-                  // Step 4: Get fuel types
-                  logger.debug(
-                    `Fetching fuel types for body type: ${bodyTypeData.name}`
-                  );
-                  const fuelTypes = this.mapFormRows(
-                    await this.fetchFormDatalist(
-                      `/vehicle-specs/v1/fuel-types/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
-                    )
-                  );
-
-                  for (const fuelType of fuelTypes) {
-                    try {
-                      await this.delay();
-                      const fuelTypeId = await this.getOrCreateFuelType(
-                        fuelType.id,
-                        fuelType.name
-                      );
-
-                      // Step 5: Get years
-                      logger.debug(`Fetching years for fuel type: ${fuelType.name}`);
-                      const years = this.mapFormRows(
-                        await this.fetchFormDatalist(
-                          `/vehicle-specs/v1/years/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
-                        )
-                      );
-
-                      for (const yearData of years) {
-                        try {
-                          await this.delay();
-                          const yearDbId = await this.getOrCreateYear(
-                            yearData.id
-                          );
-
-                          // Step 6: Get versions
-                          logger.debug(`Fetching versions for year: ${yearData.id}`);
-                          const versions = this.mapFormRows(
-                            await this.fetchFormDatalist(
-                              `/vehicle-specs/v1/versions/form?section1Id=${this.sectionId}&makeId=${make.id}&modelId=${model.id}&fuelId=${fuelType.id}&year=${yearData.id}&bodyTypeId=${bodyTypeId}&doors=${doors || 0}`
-                            )
-                          );
-
-                          for (const version of versions) {
-                            try {
-                              await this.insertVersion(
-                                version.id,
-                                makeId,
-                                modelId,
-                                bodyTypeDbId,
-                                fuelTypeId,
-                                yearDbId,
-                                version.name
-                              );
-                            } catch (error) {
-                              context.errors++;
-                              logger.error(
-                                `Error inserting version: ${version.name}`,
-                                {
-                                  error: error instanceof Error ? error.message : 'Unknown error',
-                                }
-                              );
-                            }
-                          }
-                        } catch (error) {
-                          context.errors++;
-                          logger.error(
-                            `Error processing year: ${yearData.id}`,
-                            {
-                              error: error instanceof Error ? error.message : 'Unknown error',
-                            }
-                          );
-                        }
-                      }
-                    } catch (error) {
-                      context.errors++;
-                      logger.error(
-                        `Error processing fuel type: ${fuelType.name}`,
-                        {
-                          error: error instanceof Error ? error.message : 'Unknown error',
-                        }
-                      );
-                    }
-                  }
-                } catch (error) {
-                  context.errors++;
-                  logger.error(
-                    `Error processing body type: ${bodyTypeData.name}`,
-                    {
-                      error: error instanceof Error ? error.message : 'Unknown error',
-                    }
-                  );
-                }
-              }
-            } catch (error) {
-              context.errors++;
-              logger.error(`Error processing model: ${model.name}`, {
-                error: error instanceof Error ? error.message : 'Unknown error',
-              });
-            }
+            tasks.push({ make, makeDbId, model });
           }
-
-          context.processed++;
-          await this.updateCrawlLog(crawlId, context);
         } catch (error) {
           context.errors++;
           logger.error(`Error processing make: ${make.name}`, {
             error: error instanceof Error ? error.message : 'Unknown error',
           });
         }
-      }
+      });
+
+      // El progreso cuenta modelos (unidad de trabajo del pool).
+      context.total = tasks.length;
+      await this.updateCrawlLog(crawlId, context);
+      logger.info(`Found ${tasks.length} models`);
+
+      // Paso 3: cada modelo (carrocería → combustible → año → versiones).
+      await runPool(tasks, this.concurrency, async (task) => {
+        try {
+          await this.crawlModel(task, context);
+        } catch (error) {
+          context.errors++;
+          logger.error(
+            `Error processing model: ${task.make.name} ${task.model.name}`,
+            { error: error instanceof Error ? error.message : 'Unknown error' }
+          );
+        }
+        context.processed++;
+        await this.updateCrawlLog(crawlId, context);
+      });
 
       // Mark as completed
       await query(
@@ -565,6 +536,8 @@ export class VehiclesScraper {
       );
 
       return 'failed';
+    } finally {
+      this.clearCaches();
     }
   }
 }
